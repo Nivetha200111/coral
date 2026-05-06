@@ -8,7 +8,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use coral_spec::ValidatedSourceManifest;
 
-use super::ColumnInfo;
+use super::{ColumnInfo, StatisticsObservation, StatisticsProfile};
 use crate::EngineExtensions;
 
 /// One managed source selected into the current query runtime.
@@ -207,6 +207,8 @@ pub struct QueryRuntimeConfig {
     pub context: QueryRuntimeContext,
     /// Optional engine extensions for this runtime build.
     pub extensions: EngineExtensions,
+    /// Column statistics to project through the runtime catalog.
+    pub statistics: StatisticsProfile,
 }
 
 impl QueryRuntimeConfig {
@@ -216,7 +218,15 @@ impl QueryRuntimeConfig {
         Self {
             context,
             extensions,
+            statistics: StatisticsProfile::empty(),
         }
+    }
+
+    /// Replaces the runtime statistics profile.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: StatisticsProfile) -> Self {
+        self.statistics = statistics;
+        self
     }
 }
 
@@ -269,6 +279,7 @@ pub struct QueryExecution {
     arrow_schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
     row_count: usize,
+    statistics_observations: Vec<StatisticsObservation>,
 }
 
 impl QueryExecution {
@@ -295,7 +306,20 @@ impl QueryExecution {
             arrow_schema,
             batches,
             row_count,
+            statistics_observations: Vec::new(),
         }
+    }
+
+    #[must_use]
+    /// Builds a query result with runtime statistics observations.
+    pub fn new_with_observations(
+        arrow_schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        statistics_observations: Vec<StatisticsObservation>,
+    ) -> Self {
+        let mut execution = Self::new(arrow_schema, batches);
+        execution.statistics_observations = statistics_observations;
+        execution
     }
 
     #[must_use]
@@ -320,5 +344,11 @@ impl QueryExecution {
     /// Returns the total number of rows across all batches.
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    #[must_use]
+    /// Returns backend scan statistics observed during successful execution.
+    pub fn statistics_observations(&self) -> &[StatisticsObservation] {
+        &self.statistics_observations
     }
 }

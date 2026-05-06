@@ -1,8 +1,8 @@
 use super::*;
-use crate::QuerySource;
 use crate::runtime::catalog;
 use crate::runtime::registry::{CompiledQuerySource, register_sources_blocking};
 use crate::runtime::source_functions::SourceFunctionRegistry;
+use crate::{QuerySource, StatisticsProfile};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
@@ -314,7 +314,12 @@ fn register_test_sources(ctx: &SessionContext, sources: Vec<CompiledQuerySource>
 
 fn register_test_sources_with_catalog(ctx: &SessionContext, sources: Vec<CompiledQuerySource>) {
     let registration = register_sources_blocking(ctx, sources).expect("mcp source should register");
-    catalog::register(ctx, &registration.active_sources).expect("catalog should register");
+    catalog::register(
+        ctx,
+        &registration.active_sources,
+        &StatisticsProfile::empty(),
+    )
+    .expect("catalog should register");
     let source_functions = SourceFunctionRegistry::new(
         registration
             .active_sources

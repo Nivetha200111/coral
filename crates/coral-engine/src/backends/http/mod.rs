@@ -139,6 +139,7 @@ impl CompiledBackendSource for HttpCompiledSource {
             table_functions,
             source: RegisteredSource {
                 schema_name: self.manifest.common.name.clone(),
+                source_version: self.manifest.common.version.clone(),
                 tables: table_infos,
                 table_functions: table_function_infos,
                 inputs,

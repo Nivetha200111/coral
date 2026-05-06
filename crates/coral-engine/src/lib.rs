@@ -66,10 +66,13 @@ pub use composition::{
     SourceTables,
 };
 pub use contracts::{
-    CatalogInfo, ColumnInfo, CoreError, QueryExecution, QueryPlan, QueryRuntimeConfig,
-    QueryRuntimeContext, QuerySource, QueryTestFailure, QueryTestResult, QueryTestSuccess,
-    SourceValidationReport, StatusCode, StructuredQueryError, TableFunctionArgumentInfo,
-    TableFunctionInfo, TableFunctionResultColumnInfo, TableInfo,
+    CatalogInfo, ColumnInfo, ColumnSchemaSignature, ColumnStatistics, ColumnStatisticsObservation,
+    CoreError, QueryExecution, QueryPlan, QueryRuntimeConfig, QueryRuntimeContext, QuerySource,
+    QueryTestFailure, QueryTestResult, QueryTestSuccess, SourceStatistics, SourceValidationReport,
+    StatisticPrecision, StatisticValue, StatisticsObservation, StatisticsObservationScope,
+    StatisticsProfile, StatusCode, StructuredQueryError, TableFunctionArgumentInfo,
+    TableFunctionInfo, TableFunctionResultColumnInfo, TableInfo, TableSchemaSignature,
+    TableStatistics,
 };
 
 /// High-level query operations for the local query engine.

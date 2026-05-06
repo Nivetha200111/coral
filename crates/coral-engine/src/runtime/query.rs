@@ -73,6 +73,7 @@ pub(crate) async fn build_runtime(
     let QueryRuntimeConfig {
         context: runtime_context,
         mut extensions,
+        statistics,
     } = runtime;
     let mut source_candidates = Vec::new();
     for source in sources {
@@ -97,7 +98,7 @@ pub(crate) async fn build_runtime(
         extensions.source_decorators.as_mut_slice(),
     )
     .await?;
-    catalog::register(&ctx, &registration.active_sources)
+    catalog::register(&ctx, &registration.active_sources, &statistics)
         .map_err(|err| datafusion_to_core(&err, &[]))?;
     let tables = catalog::collect_tables(&registration.active_sources);
     let table_functions = catalog::collect_table_functions(&registration.active_sources);
