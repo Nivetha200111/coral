@@ -55,6 +55,20 @@ Agents should treat the discovery tools as catalog helpers, not as replacement p
 
 For deeper introspection, query `coral.tables`, `coral.columns`, `coral.filters`, `coral.table_functions`, and `coral.inputs` through the `sql` tool instead of relying only on `list_catalog` or `coral://tables`. Use `coral.filters` as the normalized filter surface, with `coral.columns.filter_mode` available when inspecting filter-only virtual columns.
 
+### Column-level statistics
+
+When Coral has observed a table through local query execution, `coral.columns` also exposes nullable column-statistic fields.
+
+| Field                   | Type   | Meaning                                                              |
+| ----------------------- | ------ | -------------------------------------------------------------------- |
+| `null_fraction`         | double | Share of observed rows that were `NULL` (`0.0`-`1.0`).               |
+| `approx_distinct_count` | int64  | Approximate number of distinct non-null values seen.                 |
+| `stats_sample_count`    | int64  | Row count the observation was computed over.                         |
+| `stats_observed_at`     | string | ISO-8601 timestamp of the last observation.                          |
+| `stats_precision`       | string | Confidence tag: `exact`, `approximate`, `observed_sample`, or `unknown`. |
+
+Coral reports these best-effort observations through local trace history and materializes a per-workspace cache under its [local state directory](/getting-started/installation#local-state) at `workspaces/<workspace>/statistics/profile.json`. Values reflect successful local queries that touched the table, may be sample-derived, and unsupported column types may stay `NULL`. Agents should treat them as hints unless `stats_precision` is `exact`.
+
 ### Searching a provider's data
 
 Some sources expose native search endpoints (for example, GitHub issue search) as table functions with `kind = 'search'`. Prefer these over scanning a regular table when the agent needs ranked, query-driven results. They return provider-ranked candidates, so agents should preserve any returned rank columns and use the returned ids plus catalog-described tables to fetch full detail rows when the search result itself is incomplete.
