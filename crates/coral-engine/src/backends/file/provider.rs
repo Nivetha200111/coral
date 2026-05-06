@@ -19,10 +19,12 @@ use coral_spec::backends::file::{FileFormat, FileTableSpec};
 
 use super::listing::{PreparedListingTable, prepare_listing_table};
 use super::parquet_schema::infer_schema_expand_dicts;
+use super::{FileStatisticsRegistration, FileTableStatistics};
 
 #[derive(Debug)]
 pub(crate) struct FileTableProvider {
     inner: ListingTable,
+    statistics: Option<FileTableStatistics>,
 }
 
 impl FileTableProvider {
@@ -33,12 +35,13 @@ impl FileTableProvider {
     /// Returns a `DataFusionError` if the file source configuration is
     /// invalid or the listing table cannot be constructed.
     #[cfg(test)]
-    pub(crate) fn try_new(
+    pub(super) fn try_new(
         ctx: &SessionContext,
         source_schema: &str,
         table: FileTableSpec,
         home_dir: Option<&Path>,
         resolved_inputs: &BTreeMap<String, String>,
+        statistics: Option<FileStatisticsRegistration>,
     ) -> Result<Self> {
         futures::executor::block_on(Self::try_new_async(
             ctx,
@@ -46,15 +49,17 @@ impl FileTableProvider {
             table,
             home_dir,
             resolved_inputs,
+            statistics,
         ))
     }
 
-    pub(crate) async fn try_new_async(
+    pub(super) async fn try_new_async(
         ctx: &SessionContext,
         source_schema: &str,
         table: FileTableSpec,
         home_dir: Option<&Path>,
         resolved_inputs: &BTreeMap<String, String>,
+        statistics: Option<FileStatisticsRegistration>,
     ) -> Result<Self> {
         let inner = Self::build_listing_table(
             ctx.clone(),
@@ -64,7 +69,18 @@ impl FileTableProvider {
             resolved_inputs,
         )
         .await?;
-        Ok(Self { inner })
+        let schema = inner.schema();
+        let table_metadata = super::registered_table(&table, &schema);
+        let statistics = statistics.map(|registration| {
+            FileTableStatistics::new(
+                source_schema,
+                table.name(),
+                table_metadata.schema_signature(),
+                schema.fields().len(),
+                registration,
+            )
+        });
+        Ok(Self { inner, statistics })
     }
 
     async fn build_listing_table(
@@ -145,6 +161,10 @@ impl TableProvider for FileTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
+        let exec = self.inner.scan(state, projection, filters, limit).await?;
+        Ok(match &self.statistics {
+            Some(statistics) => statistics.observe_scan(exec, projection, filters, limit),
+            None => exec,
+        })
     }
 }

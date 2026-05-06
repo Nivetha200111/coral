@@ -19,6 +19,8 @@ use crate::backends::schema_from_columns;
 use crate::backends::shared::filter_expr::{extract_filter_values, literal_to_string};
 use crate::backends::shared::json_exec::{JsonExec, RowFetcher};
 use crate::backends::shared::mapping::convert_items;
+use crate::contracts::{StatisticsObservationScope, TableSchemaSignature};
+use crate::runtime::statistics::BatchStatisticsPlan;
 use coral_spec::FilterMode;
 use coral_spec::backends::http::HttpTableSpec;
 
@@ -26,9 +28,11 @@ use coral_spec::backends::http::HttpTableSpec;
 pub(crate) struct HttpSourceTableProvider {
     backend: HttpSourceClient,
     source_schema: String,
+    source_version: Option<String>,
     table: Arc<HttpTableSpec>,
     target: HttpFetchTarget,
     schema: SchemaRef,
+    schema_signature: TableSchemaSignature,
 }
 
 impl std::fmt::Debug for HttpSourceTableProvider {
@@ -50,16 +54,20 @@ impl HttpSourceTableProvider {
     pub(crate) fn new(
         backend: HttpSourceClient,
         source_schema: String,
+        source_version: Option<String>,
         table: HttpTableSpec,
+        schema_signature: TableSchemaSignature,
     ) -> Result<Self> {
         let schema = schema_from_columns(table.columns(), &source_schema, table.name())?;
         let target = HttpFetchTarget::from_resolved_table_request(&table, table.request.clone());
         Ok(Self {
             backend,
             source_schema,
+            source_version,
             table: Arc::new(table),
             target,
             schema,
+            schema_signature,
         })
     }
 }
@@ -209,17 +217,69 @@ impl TableProvider for HttpSourceTableProvider {
         let filter_value_keys: HashSet<String> = filter_values.keys().cloned().collect();
         let active_request = self.table.resolve_request(&filter_value_keys).clone();
         let target = self.target.with_resolved_request(active_request);
-
-        http_json_exec(HttpJsonExecRequest {
+        let filters = Arc::new(filter_values);
+        let effective_limit = limit.or_else(|| target.fetch_limit_default());
+        let statistics_plan = self.statistics_plan(filters.as_ref(), effective_limit);
+        let target = Arc::new(target);
+        let arg_values = Arc::new(HashMap::new());
+        let fetcher = Arc::new(HttpFetchPlan {
             backend: self.backend.clone(),
-            source_schema: &self.source_schema,
-            target,
-            schema: self.schema.clone(),
-            filter_values,
-            arg_values: HashMap::new(),
-            projection,
+            target: target.clone(),
+            filter_values: filters.clone(),
+            arg_values: arg_values.clone(),
             limit,
-        })
+        });
+
+        let schema = self.schema.clone();
+        let filters_for_convert = filters;
+        let args_for_convert = arg_values;
+        let target_for_convert = target.clone();
+        let converter = Arc::new(move |items: &[Value]| {
+            convert_items(
+                target_for_convert.columns(),
+                schema.clone(),
+                filters_for_convert.as_ref(),
+                args_for_convert.as_ref(),
+                items,
+            )
+        });
+
+        let exec = JsonExec::new_with_statistics(
+            &self.source_schema,
+            self.table.name(),
+            self.schema.clone(),
+            fetcher,
+            converter,
+            projection.cloned(),
+            statistics_plan,
+        )?;
+
+        Ok(Arc::new(exec))
+    }
+}
+
+impl HttpSourceTableProvider {
+    fn statistics_plan(
+        &self,
+        filters: &HashMap<String, String>,
+        effective_limit: Option<usize>,
+    ) -> BatchStatisticsPlan {
+        let scope = if effective_limit.is_some() {
+            StatisticsObservationScope::Limited
+        } else if filters.is_empty() {
+            StatisticsObservationScope::TableGlobal
+        } else {
+            let mut filter_columns = filters.keys().cloned().collect::<Vec<_>>();
+            filter_columns.sort();
+            StatisticsObservationScope::Filtered { filter_columns }
+        };
+        BatchStatisticsPlan::table_global(
+            self.source_schema.clone(),
+            self.table.name().to_string(),
+            self.source_version.clone(),
+            self.schema_signature.clone(),
+        )
+        .with_scope(scope)
     }
 }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use coral_engine::{
     CoralQuery, CoreError, EngineExtensions, QueryRuntimeConfig, QueryRuntimeContext,
-    RequestAuthenticator, RequestAuthenticatorError, StatusCode,
+    RequestAuthenticator, RequestAuthenticatorError, StatisticsObservationScope, StatusCode,
 };
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use serde_json::{Value, json};
@@ -19,7 +19,8 @@ use wiremock::matchers::{
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::harness::{
-    build_source, build_source_with_secrets, execution_to_rows, test_runtime, users_rows,
+    build_source, build_source_with_secrets, execute_sql_with_trace_observations,
+    execution_to_rows, test_runtime, users_rows,
 };
 
 fn base_http_manifest(name: &str, base_url: &str) -> Value {
@@ -286,17 +287,64 @@ async fn select_all_from_http_source() {
 
     let source = build_source(base_http_manifest("http_users", &server.uri()));
 
-    let rows = execution_to_rows(
-        &CoralQuery::execute_sql(
-            &[source],
-            test_runtime(),
-            "SELECT id, name, email FROM http_users.users ORDER BY id",
-        )
-        .await
-        .expect("query should succeed"),
-    );
+    let (execution, observations) = execute_sql_with_trace_observations(
+        &[source],
+        "SELECT id, name, email FROM http_users.users ORDER BY id",
+    )
+    .await
+    .expect("query should succeed");
+    let rows = execution_to_rows(&execution);
 
     assert_eq!(rows, users_rows());
+
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].scope,
+        StatisticsObservationScope::TableGlobal
+    );
+    let by_name = observations[0]
+        .columns
+        .iter()
+        .map(|column| (column.column_name.as_str(), column))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(by_name["id"].sample_count, 3);
+    assert_eq!(
+        by_name["name"]
+            .approx_distinct_count
+            .as_ref()
+            .unwrap()
+            .value,
+        3
+    );
+}
+
+#[tokio::test]
+async fn default_capped_http_scan_emits_limited_statistics_observation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/users"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": users_rows() })))
+        .mount(&server)
+        .await;
+
+    let mut manifest = base_http_manifest("http_default_limit", &server.uri());
+    manifest["tables"][0]["fetch_limit_default"] = json!(2);
+    let source = build_source(manifest);
+
+    let (execution, observations) = execute_sql_with_trace_observations(
+        &[source],
+        "SELECT id, name, email FROM http_default_limit.users ORDER BY id",
+    )
+    .await
+    .expect("query should succeed");
+    let rows = execution_to_rows(&execution);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], 1);
+    assert_eq!(rows[1]["id"], 2);
+
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].scope, StatisticsObservationScope::Limited);
 }
 
 #[tokio::test]
@@ -407,17 +455,23 @@ async fn select_with_where_filter_pushdown() {
     ]);
     let source = build_source(manifest);
 
-    let rows = execution_to_rows(
-        &CoralQuery::execute_sql(
-            &[source],
-            test_runtime(),
-            "SELECT id, name FROM http_filter.users WHERE id = 2",
-        )
-        .await
-        .expect("query should succeed"),
-    );
+    let (execution, observations) = execute_sql_with_trace_observations(
+        &[source],
+        "SELECT id, name FROM http_filter.users WHERE id = 2",
+    )
+    .await
+    .expect("query should succeed");
+    let rows = execution_to_rows(&execution);
 
     assert_eq!(rows, vec![json!({"id": 2, "name": "Grace"})]);
+
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].scope,
+        StatisticsObservationScope::Filtered {
+            filter_columns: vec!["id".to_string()]
+        }
+    );
 }
 
 #[tokio::test]

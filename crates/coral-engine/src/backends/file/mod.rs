@@ -10,7 +10,7 @@ mod provider;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
 use crate::backends::{
@@ -25,6 +27,8 @@ use crate::backends::{
     RegisteredTable, build_registered_inputs, build_registered_table,
     registered_columns_from_schema, registered_columns_from_specs, required_filter_names,
 };
+use crate::contracts::{StatisticsObservationScope, TableSchemaSignature};
+use crate::runtime::statistics::{BatchStatisticsPlan, observe_execution_plan};
 use coral_spec::backends::file::{FileFormat, FileSourceManifest, FileTableSpec};
 
 use self::json::JsonFileTableProvider;
@@ -64,6 +68,116 @@ pub(crate) fn compile_manifest(
     )
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct FileStatisticsRegistration {
+    source_version: String,
+}
+
+impl FileStatisticsRegistration {
+    fn new(source_version: impl Into<String>) -> Self {
+        Self {
+            source_version: source_version.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FileTableStatistics {
+    source_schema: String,
+    table_name: String,
+    source_version: Option<String>,
+    schema_signature: TableSchemaSignature,
+    field_count: usize,
+}
+
+impl FileTableStatistics {
+    fn new(
+        source_schema: &str,
+        table_name: &str,
+        schema_signature: TableSchemaSignature,
+        field_count: usize,
+        registration: FileStatisticsRegistration,
+    ) -> Self {
+        Self {
+            source_schema: source_schema.to_string(),
+            table_name: table_name.to_string(),
+            source_version: Some(registration.source_version),
+            schema_signature,
+            field_count,
+        }
+    }
+
+    fn observe_scan(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        observe_execution_plan(input, self.plan(projection, filters, limit))
+    }
+
+    fn plan(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> BatchStatisticsPlan {
+        BatchStatisticsPlan::table_global(
+            self.source_schema.clone(),
+            self.table_name.clone(),
+            self.source_version.clone(),
+            self.schema_signature.clone(),
+        )
+        .with_scope(statistics_scope(
+            projection,
+            self.field_count,
+            filters,
+            limit,
+        ))
+    }
+}
+
+fn statistics_scope(
+    projection: Option<&Vec<usize>>,
+    field_count: usize,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> StatisticsObservationScope {
+    if limit.is_some() || projection_is_partial(projection, field_count) {
+        return StatisticsObservationScope::Limited;
+    }
+    if filters.is_empty() {
+        StatisticsObservationScope::TableGlobal
+    } else {
+        StatisticsObservationScope::Filtered {
+            filter_columns: filter_column_names(filters),
+        }
+    }
+}
+
+fn projection_is_partial(projection: Option<&Vec<usize>>, field_count: usize) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    projection.iter().copied().collect::<BTreeSet<_>>().len() != field_count
+}
+
+fn filter_column_names(filters: &[Expr]) -> Vec<String> {
+    let mut columns = filters
+        .iter()
+        .flat_map(|expr| {
+            expr.column_refs()
+                .into_iter()
+                .map(|column| column.name().to_string())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    columns.sort();
+    columns
+}
+
 #[async_trait]
 impl CompiledBackendSource for FileCompiledSource {
     fn schema_name(&self) -> &str {
@@ -84,6 +198,13 @@ impl CompiledBackendSource for FileCompiledSource {
         );
 
         for table in &self.manifest.tables {
+            let table_statistics = if matches!(table.format, FileFormat::Json | FileFormat::Jsonl) {
+                Some(FileStatisticsRegistration::new(
+                    self.manifest.common.version.clone(),
+                ))
+            } else {
+                None
+            };
             let provider: Arc<dyn TableProvider> = match table.format {
                 FileFormat::Jsonl | FileFormat::Json if json::requires_custom_provider(table)? => {
                     Arc::new(
@@ -93,6 +214,7 @@ impl CompiledBackendSource for FileCompiledSource {
                             table.clone(),
                             self.home_dir.as_deref(),
                             &resolved_inputs,
+                            table_statistics,
                         )
                         .await?,
                     )
@@ -105,6 +227,7 @@ impl CompiledBackendSource for FileCompiledSource {
                             table.clone(),
                             self.home_dir.as_deref(),
                             &resolved_inputs,
+                            table_statistics,
                         )
                         .await?,
                     )

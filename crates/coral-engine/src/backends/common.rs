@@ -16,6 +16,8 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 
+use crate::contracts::{ColumnSchemaSignature, TableSchemaSignature};
+
 pub(crate) type SourceTableFunctions = HashMap<String, Arc<dyn TableFunctionImpl>>;
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,25 @@ pub(crate) struct RegisteredTable {
     pub(crate) filters: Vec<RegisteredFilter>,
     pub(crate) required_filters: Vec<String>,
     pub(crate) search_limits_json: Option<String>,
+}
+
+impl RegisteredTable {
+    pub(crate) fn schema_signature(&self) -> TableSchemaSignature {
+        TableSchemaSignature {
+            columns: self
+                .columns
+                .iter()
+                .map(|column| ColumnSchemaSignature {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                    is_virtual: column.is_virtual,
+                    is_required_filter: column.is_required_filter,
+                })
+                .collect(),
+            required_filters: self.required_filters.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

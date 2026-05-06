@@ -99,13 +99,16 @@ impl CompiledBackendSource for HttpCompiledSource {
         let mut table_infos = Vec::with_capacity(self.manifest.tables.len());
 
         for table in &self.manifest.tables {
+            let metadata = registered_table(table);
             let provider: Arc<dyn TableProvider> = Arc::new(HttpSourceTableProvider::new(
                 backend.clone(),
                 self.manifest.common.name.clone(),
+                Some(self.manifest.common.version.clone()),
                 table.clone(),
+                metadata.schema_signature(),
             )?);
             tables.insert(table.name().to_string(), provider);
-            table_infos.push(registered_table(table));
+            table_infos.push(metadata);
         }
         let mut table_functions =
             SourceTableFunctions::with_capacity(self.manifest.functions.len());

@@ -175,12 +175,15 @@ impl QueryRuntimeAdapter {
     pub(crate) async fn execute_sql(&self, sql: &str) -> Result<QueryExecution, CoreError> {
         let df = self.sql_dataframe(sql).await?;
         let arrow_schema = Arc::new(df.schema().as_arrow().clone());
-        let batches = df
-            .collect()
-            .await
-            .map_err(|err| datafusion_to_core(&err, &self.tables))?;
-        self.observe_query_result(sql, arrow_schema.as_ref(), &batches)?;
-        Ok(QueryExecution::new(arrow_schema, batches))
+        match df.collect().await {
+            Ok(batches) => {
+                let observer_result =
+                    self.observe_query_result(sql, arrow_schema.as_ref(), &batches);
+                observer_result?;
+                Ok(QueryExecution::new(arrow_schema, batches))
+            }
+            Err(err) => Err(datafusion_to_core(&err, &self.tables)),
+        }
     }
 
     fn observe_query_result(
