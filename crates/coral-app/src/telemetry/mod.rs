@@ -24,6 +24,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
+use coral_engine::StatisticsObservation;
+
 pub mod config;
 mod local_store;
 pub mod metrics;
@@ -564,6 +566,24 @@ pub fn shutdown_tracing() {
     {
         tracing::warn!("OTEL logger provider shutdown error: {error}");
     }
+}
+
+pub(crate) fn force_flush_tracing() {
+    if let Ok(guard) = PROVIDER.lock()
+        && let Some(provider) = guard.as_ref()
+        && let Err(error) = provider.force_flush()
+    {
+        tracing::warn!("OTEL trace provider force_flush error: {error}");
+    }
+}
+
+pub(crate) async fn load_statistics_observations(
+    store: &InstalledLocalTraceStore,
+) -> Result<Vec<StatisticsObservation>, AppError> {
+    local_store::TraceStore::with_retention(store.dir.clone(), store.retention)
+        .statistics_observations()
+        .await
+        .map_err(|error| AppError::InvalidInput(error.to_string()))
 }
 
 #[cfg(test)]

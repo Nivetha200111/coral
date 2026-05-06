@@ -9,6 +9,7 @@ use crate::bootstrap::AppError;
 use crate::sources::SourceName;
 use crate::sources::model::{InstalledSource, SourceOrigin};
 use crate::state::AppStateLayout;
+use crate::state::statistics;
 use crate::storage::fs::{self as storage_fs, FileLock};
 use crate::workspaces::WorkspaceName;
 
@@ -227,6 +228,18 @@ impl ConfigStore {
         self.update_catalog(|catalog| catalog.upsert_source(workspace_name, source))
     }
 
+    pub(crate) fn upsert_source_and_invalidate_statistics(
+        &self,
+        workspace_name: &WorkspaceName,
+        source: InstalledSource,
+    ) -> Result<(), AppError> {
+        let _lock = self.lock_exclusive()?;
+        statistics::invalidate_source_unlocked(&self.layout, workspace_name, &source.name)?;
+        let mut config = self.load_unlocked()?;
+        config.catalog.upsert_source(workspace_name, source);
+        self.save_unlocked(&config)
+    }
+
     pub(crate) fn remove_source(
         &self,
         workspace_name: &WorkspaceName,
@@ -235,6 +248,18 @@ impl ConfigStore {
         self.update_catalog(|catalog| {
             catalog.remove_source(workspace_name, source_name);
         })
+    }
+
+    pub(crate) fn remove_source_and_invalidate_statistics(
+        &self,
+        workspace_name: &WorkspaceName,
+        source_name: &SourceName,
+    ) -> Result<(), AppError> {
+        let _lock = self.lock_exclusive()?;
+        statistics::invalidate_source_unlocked(&self.layout, workspace_name, source_name)?;
+        let mut config = self.load_unlocked()?;
+        config.catalog.remove_source(workspace_name, source_name);
+        self.save_unlocked(&config)
     }
 }
 

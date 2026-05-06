@@ -1,6 +1,6 @@
 //! JSONL-backed span export for local trace capture.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use coral_engine::StatisticsObservation;
 use opentelemetry::trace::{SpanId, SpanKind, Status};
 use opentelemetry::{Array as OtelArray, KeyValue, Value as OtelValue};
 use opentelemetry_sdk::Resource;
@@ -498,6 +499,16 @@ struct TraceSpanAttributesRecord {
 }
 
 #[derive(Debug, Deserialize)]
+struct TraceSpanStatisticsRecord {
+    trace_id: String,
+    name: String,
+    #[serde(default)]
+    status: StoredTraceStatus,
+    attributes_json: String,
+    events_json: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TraceSpanIdentityRecord {
     trace_id: String,
 }
@@ -535,6 +546,15 @@ impl TraceStore {
     ) -> Result<TraceDetailRecord, TraceStoreError> {
         let traces = self.clone();
         task::spawn_blocking(move || traces.get_trace_sync(&trace_id))
+            .await
+            .map_err(|source| TraceStoreError::Worker { source })?
+    }
+
+    pub(crate) async fn statistics_observations(
+        &self,
+    ) -> Result<Vec<StatisticsObservation>, TraceStoreError> {
+        let traces = self.clone();
+        task::spawn_blocking(move || traces.statistics_observations_sync())
             .await
             .map_err(|source| TraceStoreError::Worker { source })?
     }
@@ -610,6 +630,33 @@ impl TraceStore {
 
         let summary = summary_from_spans(trace_id, &spans);
         Ok(TraceDetailRecord { summary, spans })
+    }
+
+    fn statistics_observations_sync(&self) -> Result<Vec<StatisticsObservation>, TraceStoreError> {
+        self.prune_expired()?;
+        let mut successful_query_traces = HashSet::new();
+        let mut observations = Vec::new();
+        for path in self.jsonl_files()? {
+            let records = read_statistics_observation_records_file(&path)?;
+            for record in records {
+                if successful_query_span(&record) {
+                    successful_query_traces.insert(record.trace_id.clone());
+                }
+                observations.extend(
+                    statistics_observations_from_events(&record.events_json)
+                        .into_iter()
+                        .map(|observation| (record.trace_id.clone(), observation)),
+                );
+            }
+        }
+        Ok(observations
+            .into_iter()
+            .filter_map(|(trace_id, observation)| {
+                successful_query_traces
+                    .contains(&trace_id)
+                    .then_some(observation)
+            })
+            .collect())
     }
 
     fn prune_expired(&self) -> Result<(), TraceStoreError> {
@@ -860,6 +907,94 @@ fn read_trace_spans_file(
     }
 
     Ok(spans)
+}
+
+fn read_statistics_observation_records_file(
+    path: &Path,
+) -> Result<Vec<TraceSpanStatisticsRecord>, TraceStoreError> {
+    let file = File::open(path).map_err(|source| TraceStoreError::OpenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut records = Vec::new();
+    let mut line = String::new();
+    let mut line_number = 0;
+
+    loop {
+        line.clear();
+        let bytes_read =
+            reader
+                .read_line(&mut line)
+                .map_err(|source| TraceStoreError::ReadFile {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        line_number += 1;
+        let complete_line = line.ends_with('\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<TraceSpanStatisticsRecord>(trimmed) {
+            Ok(record) => records.push(record),
+            Err(_) if !complete_line => break,
+            Err(source) => {
+                return Err(TraceStoreError::DecodeLine {
+                    path: path.to_path_buf(),
+                    line: line_number,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+fn successful_query_span(record: &TraceSpanStatisticsRecord) -> bool {
+    if record.name != "coral.query" {
+        return false;
+    }
+    status_from_attributes(parse_attributes(&record.attributes_json).as_ref())
+        .unwrap_or(record.status)
+        == StoredTraceStatus::Ok
+}
+
+fn statistics_observations_from_events(events_json: &str) -> Vec<StatisticsObservation> {
+    let Ok(events) = serde_json::from_str::<JsonValue>(events_json) else {
+        return Vec::new();
+    };
+    let Some(events) = events.get("events").and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+
+    events
+        .iter()
+        .filter_map(statistics_observation_from_event)
+        .collect()
+}
+
+fn statistics_observation_from_event(event: &JsonValue) -> Option<StatisticsObservation> {
+    let payload = event
+        .get("attributes")?
+        .get("coral.statistics.observation")?
+        .as_str()?;
+    match serde_json::from_str(payload) {
+        Ok(observation) => Some(observation),
+        Err(error) => {
+            tracing::warn!(
+                detail = %error,
+                "skipping malformed statistics observation trace event"
+            );
+            None
+        }
+    }
 }
 
 fn summary_from_spans(trace_id: &str, spans: &[TraceSpanRecord]) -> TraceSummaryRecord {
@@ -1594,6 +1729,73 @@ mod tests {
         assert!(old_name_fresh_path.exists());
         assert_eq!(traces.len(), 1);
         assert_eq!(traces.first().expect("fresh trace").trace_id, "fresh-trace");
+    }
+
+    #[test]
+    fn trace_store_reads_statistics_observation_events() {
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path().join("telemetry").join("traces");
+        fs::create_dir_all(&dir).expect("trace dir");
+        let observation = json!({
+            "schema_name": "local",
+            "table_name": "events",
+            "source_version": "0.1.0",
+            "schema_signature": {
+                "columns": [{
+                    "name": "id",
+                    "data_type": "Int64",
+                    "nullable": false,
+                    "is_virtual": false,
+                    "is_required_filter": false
+                }],
+                "required_filters": []
+            },
+            "scope": "table_global",
+            "observed_at": "2026-05-06T00:00:00Z",
+            "columns": [{
+                "column_name": "id",
+                "sample_count": 3,
+                "null_count": {"value": 0, "precision": "observed_sample"},
+                "approx_distinct_count": {"value": 3, "precision": "observed_sample"}
+            }]
+        });
+        let mut record = trace_record("trace-1", "span-1");
+        record.events_json = json!({
+            "events": [{
+                "name": "coral.statistics.observation",
+                "time_unix_nanos": 1,
+                "attributes": {
+                    "coral.statistics.observation": observation.to_string()
+                }
+            }]
+        })
+        .to_string();
+        write_record_file(
+            &dir.join(timestamped_jsonl_path(SystemTime::now())),
+            &record,
+        );
+        let mut failed_record = trace_record("failed-trace", "failed-span");
+        failed_record.status = StoredTraceStatus::Error;
+        failed_record.attributes_json = r#"{"status":"error"}"#.to_string();
+        failed_record.events_json = record.events_json.clone();
+        write_record_file(
+            &dir.join("spans-00000000000000000002-test-0000000000000000.jsonl"),
+            &failed_record,
+        );
+
+        let observations = TraceStore::new(dir)
+            .statistics_observations_sync()
+            .expect("statistics observations");
+
+        assert_eq!(observations.len(), 1);
+        let observation = observations.first().expect("observation");
+        assert_eq!(observation.schema_name, "local");
+        assert_eq!(
+            observation.scope,
+            coral_engine::StatisticsObservationScope::TableGlobal
+        );
+        let column = observation.columns.first().expect("column observation");
+        assert_eq!(column.sample_count, 3);
     }
 
     #[test]

@@ -283,7 +283,8 @@ impl ServerBuilder {
             query_runtime_context,
             layout,
             self.config.engine_extensions_providers,
-        );
+        )
+        .with_local_trace_store(installed_trace_store.clone());
         let trace_service = if telemetry_config.trace_history.enabled {
             installed_trace_store.map(|store| TraceService::new(store.dir, store.retention))
         } else {
