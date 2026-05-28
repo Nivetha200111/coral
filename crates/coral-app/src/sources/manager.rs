@@ -587,6 +587,10 @@ impl SourceManager {
         Ok(candidate)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Source persistence keeps rollback steps together so failure ordering is visible."
+    )]
     fn persist_source(
         &self,
         workspace_name: &WorkspaceName,
@@ -1444,7 +1448,7 @@ tables:
     }
 
     fn v4_openapi_fixture() -> &'static str {
-        r#"
+        r"
 openapi: 3.0.3
 paths:
   /repos/{owner}/{repo}/issues:
@@ -1467,7 +1471,7 @@ components:
       properties:
         id: {type: integer}
         title: {type: string}
-"#
+"
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
