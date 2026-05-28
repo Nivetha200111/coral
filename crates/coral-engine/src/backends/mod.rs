@@ -92,6 +92,7 @@ pub(crate) fn compile_query_source(
     runtime_context: &crate::QueryRuntimeContext,
     request_authenticators: &HashMap<String, Arc<dyn RequestAuthenticator>>,
     source_input_resolver: Option<Arc<dyn SourceInputResolver>>,
+    http_cache_registry: Option<Arc<crate::backends::http::cache::HttpCacheRegistry>>,
 ) -> Result<Box<dyn CompiledBackendSource>, CoreError> {
     compile_validated_manifest(
         source.source_spec(),
@@ -102,6 +103,7 @@ pub(crate) fn compile_query_source(
             source_variables: source.variables().clone(),
             request_authenticators,
             source_input_resolver,
+            http_cache_registry,
         },
     )
 }
@@ -128,6 +130,7 @@ pub(crate) fn compile_source_manifest(
             source_variables,
             request_authenticators: &request_authenticators,
             source_input_resolver: None,
+            http_cache_registry: None,
         },
     )
 }

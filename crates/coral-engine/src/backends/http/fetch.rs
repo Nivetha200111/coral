@@ -1,27 +1,166 @@
 //! Paginated HTTP fetch orchestration.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use datafusion::error::{DataFusionError, Result};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
 use crate::backends::http::ProviderQueryError;
+use crate::backends::http::cache::{HttpCacheEntry, build_cache_key, estimate_json_bytes};
 use crate::backends::http::client::HttpSourceClient;
 use crate::backends::http::error::{pagination_error, provider_error};
 use crate::backends::http::pagination::{
     PageState, apply_pagination_body_fields, apply_pagination_query_pairs, page_is_exhausted,
     pagination_state_values, resolve_page_size,
 };
-use crate::backends::http::request::{build_query_pairs, build_request_body};
+use crate::backends::http::request::{RequestBody, build_query_pairs, build_request_body};
 use crate::backends::http::target::HttpFetchTarget;
 use crate::backends::http::transport::{OutgoingHttpRequest, execute_request};
 use crate::backends::http::url::{join_url, normalize_base_url};
 use crate::backends::shared::json_path::get_path_value;
 use crate::backends::shared::response_rows::extract_rows;
-use crate::backends::shared::template::{RenderContext, render_template};
-use coral_spec::ValidatedPaginationMode;
+use crate::backends::shared::template::{
+    RenderContext, render_template, resolve_value_source, value_to_string,
+};
+use coral_spec::backends::http::HttpCacheMode;
+use coral_spec::{HeaderSpec, HttpMethod, ValidatedPaginationMode};
 
 const DEFAULT_MAX_PAGES: usize = 10_000;
+
+/// Single-flight outcome carried as `Err` for non-cacheable fetches.
+/// `Clone` is required by moka; `Arc` keeps the inner error intact.
+#[derive(Clone)]
+enum FetchSkipped {
+    NoData,
+    NotCacheable {
+        payload: Value,
+        next_url: Option<String>,
+    },
+    NetworkError(Arc<DataFusionError>),
+}
+
+impl FetchSkipped {
+    fn network_error(err: DataFusionError) -> Self {
+        Self::NetworkError(Arc::new(err))
+    }
+
+    fn no_data() -> Self {
+        Self::NoData
+    }
+
+    fn not_cacheable(payload: Value, next_url: Option<String>) -> Self {
+        Self::NotCacheable { payload, next_url }
+    }
+}
+
+/// Fallback wrapper exposing the inner error via `Error::source()`.
+#[derive(Debug)]
+struct SharedDataFusionError(Arc<DataFusionError>);
+
+impl std::fmt::Display for SharedDataFusionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::error::Error for SharedDataFusionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// moka keeps an internal `Arc` clone, so `try_unwrap` never succeeds;
+/// downcast-clone preserves the original variant for the common case.
+fn unwrap_network_error(err: Arc<DataFusionError>) -> DataFusionError {
+    if let DataFusionError::External(boxed) = &*err
+        && let Some(provider_err) = boxed.downcast_ref::<ProviderQueryError>()
+    {
+        return DataFusionError::External(Box::new(provider_err.clone()));
+    }
+    DataFusionError::External(Box::new(SharedDataFusionError(err)))
+}
+
+fn http_method_label(method: HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::GET => "GET",
+        HttpMethod::POST => "POST",
+    }
+}
+
+fn hash_cache_bytes(value: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_request_body(body: &RequestBody) -> u64 {
+    match body {
+        RequestBody::Json(value) => {
+            hash_cache_bytes(serde_json::to_string(value).unwrap_or_default().as_bytes())
+        }
+        RequestBody::Text(text) => hash_cache_bytes(text.as_bytes()),
+    }
+}
+
+fn cache_vary_header_hashes(
+    request_headers: &[HeaderSpec],
+    table_headers: &[HeaderSpec],
+    body: Option<&RequestBody>,
+    render_context: &RenderContext<'_>,
+    vary_headers: &[String],
+) -> Result<Vec<(String, Option<u64>)>> {
+    if vary_headers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut header_map = HeaderMap::new();
+    for header in request_headers.iter().chain(table_headers.iter()) {
+        if let Some(value) = resolve_value_source(&header.value, render_context)? {
+            let name = HeaderName::try_from(header.name.as_str()).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "invalid request header name '{}': {error}",
+                    header.name
+                ))
+            })?;
+            let value =
+                HeaderValue::try_from(value_to_string(&value).as_str()).map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "invalid request header value for '{}': {error}",
+                        header.name
+                    ))
+                })?;
+            header_map.insert(name, value);
+        }
+    }
+    if matches!(body, Some(RequestBody::Text(_)))
+        && !header_map.contains_key(reqwest::header::CONTENT_TYPE)
+    {
+        header_map.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+    }
+
+    vary_headers
+        .iter()
+        .map(|header| {
+            let name = HeaderName::try_from(header.as_str()).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "invalid cache vary header name '{header}': {error}"
+                ))
+            })?;
+            let value_hash = header_map
+                .get(&name)
+                .map(|value| hash_cache_bytes(value.as_bytes()));
+            Ok((name.as_str().to_string(), value_hash))
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FetchLimits {
@@ -145,32 +284,162 @@ pub(super) async fn fetch_rows(
             (query_pairs, body)
         };
 
-        let request = execute_request(
-            &client.http,
-            client.request_timeout,
-            OutgoingHttpRequest {
-                auth: &client.auth,
-                request_headers: &client.request_headers,
-                request_authenticators: &client.request_authenticators,
-                table_headers: &active_request.headers,
-                table_name: target.name(),
-                method: active_request.method,
-                base_url: &base_url,
-                url: &url,
-                query_pairs: &query_pairs,
-                body: body.as_ref(),
-                response_format: target.response().format,
-                source_schema: &client.source_schema,
-                rate_limit: &client.rate_limit,
-                body_capture: client.body_capture,
-                render_context,
-                allow_404_empty: target.response().allow_404_empty,
-                link_header_require_results: pagination.link_header_require_results,
-            },
-        )
-        .await?;
+        let cache_key: Option<(String, usize, Duration)> = target
+            .cache()
+            .filter(|p| p.mode == HttpCacheMode::Ttl)
+            .filter(|policy| {
+                policy
+                    .max_pages
+                    .is_none_or(|max_cache_pages| page_count <= max_cache_pages)
+            })
+            .map(|policy| {
+                let body_hash = body.as_ref().map(hash_request_body);
+                let vary_headers = cache_vary_header_hashes(
+                    &client.request_headers,
+                    &active_request.headers,
+                    body.as_ref(),
+                    &render_context,
+                    &policy.vary_headers,
+                )?;
+                let key = build_cache_key(
+                    &client.source_schema,
+                    &client.source_version,
+                    target.name(),
+                    http_method_label(active_request.method),
+                    &url,
+                    &query_pairs,
+                    body_hash,
+                    &vary_headers,
+                    policy.ttl.as_secs(),
+                );
+                let max_entry = policy.max_entry_bytes.unwrap_or(usize::MAX);
+                Ok::<_, DataFusionError>((key, max_entry, policy.ttl))
+            })
+            .transpose()?;
 
-        let Some((payload, next_url)) = request else {
+        let page = if let Some((ref key, max_entry_bytes, ttl)) = cache_key {
+            let source_schema = client.source_schema.clone();
+            let table_name = target.name().to_string();
+            let ok_path = target.response().ok_path.clone();
+            let result = client
+                .cache
+                .try_get_or_insert_with::<_, FetchSkipped>(key, async {
+                    tracing::trace!(
+                        source = %source_schema,
+                        table = %table_name,
+                        "http cache miss"
+                    );
+                    let result = execute_request(
+                        &client.http,
+                        client.request_timeout,
+                        OutgoingHttpRequest {
+                            auth: &client.auth,
+                            request_headers: &client.request_headers,
+                            request_authenticators: &client.request_authenticators,
+                            table_headers: &active_request.headers,
+                            table_name: target.name(),
+                            method: active_request.method,
+                            base_url: &base_url,
+                            url: &url,
+                            query_pairs: &query_pairs,
+                            body: body.as_ref(),
+                            response_format: target.response().format,
+                            source_schema: &client.source_schema,
+                            rate_limit: &client.rate_limit,
+                            body_capture: client.body_capture,
+                            render_context,
+                            allow_404_empty: target.response().allow_404_empty,
+                            link_header_require_results: pagination.link_header_require_results,
+                        },
+                    )
+                    .await
+                    .map_err(FetchSkipped::network_error)?;
+                    let Some((payload, next_url)) = result else {
+                        return Err(FetchSkipped::no_data());
+                    };
+                    let estimated_bytes = estimate_json_bytes(&payload);
+                    let ok_for_cache = ok_path.is_empty()
+                        || get_path_value(&payload, &ok_path)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    if !ok_for_cache {
+                        tracing::trace!(
+                            source = %source_schema,
+                            table = %table_name,
+                            "http cache entry skipped: ok_path=false"
+                        );
+                        return Err(FetchSkipped::not_cacheable(payload, next_url));
+                    }
+                    if estimated_bytes > max_entry_bytes {
+                        tracing::trace!(
+                            source = %source_schema,
+                            table = %table_name,
+                            estimated_bytes,
+                            "http cache entry skipped: exceeds max_entry_bytes"
+                        );
+                        return Err(FetchSkipped::not_cacheable(payload, next_url));
+                    }
+                    Ok(HttpCacheEntry {
+                        payload,
+                        next_url,
+                        ttl,
+                        estimated_bytes,
+                    })
+                })
+                .await;
+
+            match result {
+                Ok((entry, is_fresh)) => {
+                    if !is_fresh {
+                        tracing::trace!(
+                            source = %client.source_schema,
+                            table = %target.name(),
+                            "http cache hit"
+                        );
+                    }
+                    Some((entry.payload, entry.next_url))
+                }
+                Err(arc) => {
+                    let skipped = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
+                    match skipped {
+                        FetchSkipped::NetworkError(err) => {
+                            return Err(unwrap_network_error(err));
+                        }
+                        FetchSkipped::NoData => None,
+                        FetchSkipped::NotCacheable { payload, next_url } => {
+                            Some((payload, next_url))
+                        }
+                    }
+                }
+            }
+        } else {
+            execute_request(
+                &client.http,
+                client.request_timeout,
+                OutgoingHttpRequest {
+                    auth: &client.auth,
+                    request_headers: &client.request_headers,
+                    request_authenticators: &client.request_authenticators,
+                    table_headers: &active_request.headers,
+                    table_name: target.name(),
+                    method: active_request.method,
+                    base_url: &base_url,
+                    url: &url,
+                    query_pairs: &query_pairs,
+                    body: body.as_ref(),
+                    response_format: target.response().format,
+                    source_schema: &client.source_schema,
+                    rate_limit: &client.rate_limit,
+                    body_capture: client.body_capture,
+                    render_context,
+                    allow_404_empty: target.response().allow_404_empty,
+                    link_header_require_results: pagination.link_header_require_results,
+                },
+            )
+            .await?
+        };
+
+        let Some((payload, next_url)) = page else {
             break;
         };
 

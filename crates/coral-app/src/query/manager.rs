@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use coral_engine::{
-    CatalogInfo, CoralQuery, CoreError, QueryExecution, QueryPlan, QueryRuntimeConfig,
-    QueryRuntimeContext, QuerySource, SourceValidationReport, StatusCode, TableInfo,
+    CatalogInfo, CoralQuery, CoreError, HttpCacheRegistry, QueryExecution, QueryPlan,
+    QueryRuntimeConfig, QueryRuntimeContext, QuerySource, SourceValidationReport, StatusCode,
+    TableInfo,
 };
 use coral_spec::{ManifestInputKind, ManifestInputSpec};
 use opentelemetry::{KeyValue, trace::Status as OtelStatus};
@@ -43,6 +44,7 @@ pub(crate) struct QueryManager {
     runtime_context: QueryRuntimeContext,
     layout: AppStateLayout,
     engine_extensions_providers: Vec<Arc<dyn EngineExtensionsProvider>>,
+    http_cache_registry: Arc<HttpCacheRegistry>,
 }
 
 impl QueryManager {
@@ -59,6 +61,7 @@ impl QueryManager {
             runtime_context,
             layout,
             engine_extensions_providers,
+            http_cache_registry: Arc::new(HttpCacheRegistry::new()),
         }
     }
 
@@ -248,6 +251,7 @@ impl QueryManager {
             self.credential_manager.clone(),
             provider_input_resolver,
         )));
+        extensions.http_cache_registry = Some(Arc::clone(&self.http_cache_registry));
         QueryRuntimeConfig::new(self.runtime_context.clone(), extensions)
     }
 }

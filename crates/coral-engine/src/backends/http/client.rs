@@ -7,6 +7,7 @@ use std::time::Duration;
 use datafusion::error::{DataFusionError, Result};
 use serde_json::Value;
 
+use crate::backends::http::cache::HttpResponseCache;
 use crate::backends::http::fetch::fetch_rows;
 use crate::backends::http::registration_checks::validate_source_scoped_http_config;
 use crate::backends::http::target::HttpFetchTarget;
@@ -23,6 +24,7 @@ pub(crate) struct HttpSourceClient {
     pub(super) http: reqwest::Client,
     pub(super) request_timeout: Duration,
     pub(super) source_schema: String,
+    pub(super) source_version: String,
     pub(super) base_url: ParsedTemplate,
     pub(super) auth: AuthSpec,
     pub(super) request_headers: Vec<HeaderSpec>,
@@ -32,6 +34,7 @@ pub(crate) struct HttpSourceClient {
     pub(super) rate_limit: RateLimitSpec,
     pub(super) resolved_inputs: Arc<BTreeMap<String, String>>,
     pub(super) body_capture: HttpBodyCapture,
+    pub(super) cache: HttpResponseCache,
 }
 
 impl std::fmt::Debug for HttpSourceClient {
@@ -70,9 +73,11 @@ impl HttpSourceClient {
             None,
             None,
             body_capture_max_bytes,
+            None,
         )
     }
 
+    #[expect(clippy::too_many_arguments, reason = "constructor parameters are distinct")]
     pub(crate) fn from_manifest_with_source_input_resolver(
         manifest: &HttpSourceManifest,
         source_secrets: &BTreeMap<String, String>,
@@ -81,6 +86,7 @@ impl HttpSourceClient {
         source: QuerySource,
         source_input_resolver: Option<Arc<dyn SourceInputResolver>>,
         body_capture_max_bytes: Option<usize>,
+        cache: Option<HttpResponseCache>,
     ) -> Result<Self> {
         Self::build(
             manifest,
@@ -90,9 +96,11 @@ impl HttpSourceClient {
             Some(source),
             source_input_resolver,
             body_capture_max_bytes,
+            cache,
         )
     }
 
+    #[expect(clippy::too_many_arguments, reason = "constructor parameters are distinct")]
     fn build(
         manifest: &HttpSourceManifest,
         source_secrets: &BTreeMap<String, String>,
@@ -101,6 +109,7 @@ impl HttpSourceClient {
         source: Option<QuerySource>,
         source_input_resolver: Option<Arc<dyn SourceInputResolver>>,
         body_capture_max_bytes: Option<usize>,
+        cache: Option<HttpResponseCache>,
     ) -> Result<Self> {
         let resolved_inputs =
             coral_spec::resolve_inputs(&manifest.declared_inputs, source_secrets, source_variables);
@@ -122,6 +131,7 @@ impl HttpSourceClient {
             http,
             request_timeout,
             source_schema: manifest.common.name.clone(),
+            source_version: manifest.common.version.clone(),
             base_url: manifest.base_url.clone(),
             auth: manifest.auth.clone(),
             request_headers: manifest.request_headers.clone(),
@@ -131,6 +141,7 @@ impl HttpSourceClient {
             rate_limit: manifest.rate_limit.clone(),
             resolved_inputs: Arc::new(resolved_inputs),
             body_capture: HttpBodyCapture::new(body_capture_max_bytes),
+            cache: cache.unwrap_or_else(HttpResponseCache::new),
         })
     }
 

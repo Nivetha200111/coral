@@ -18,6 +18,7 @@ use crate::backends::{
 use crate::{QuerySource, RequestAuthenticator, SourceInputResolver};
 use coral_spec::backends::http::{HttpSourceManifest, HttpTableSpec};
 pub(crate) mod auth;
+pub(crate) mod cache;
 pub(crate) mod client;
 pub(crate) mod error;
 mod fetch;
@@ -39,7 +40,7 @@ pub(crate) use client::HttpSourceClient;
 pub(crate) use error::ProviderQueryError;
 pub(crate) use provider::HttpSourceTableProvider;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct HttpCompiledSource {
     manifest: HttpSourceManifest,
     source: QuerySource,
@@ -48,8 +49,10 @@ struct HttpCompiledSource {
     request_authenticators: HashMap<String, Arc<dyn RequestAuthenticator>>,
     body_capture_max_bytes: Option<usize>,
     source_input_resolver: Option<Arc<dyn SourceInputResolver>>,
+    http_cache_registry: Option<Arc<cache::HttpCacheRegistry>>,
 }
 
+#[expect(clippy::too_many_arguments, reason = "compile parameters are distinct")]
 pub(crate) fn compile_source(
     manifest: HttpSourceManifest,
     source: QuerySource,
@@ -58,6 +61,7 @@ pub(crate) fn compile_source(
     request_authenticators: HashMap<String, Arc<dyn RequestAuthenticator>>,
     body_capture_max_bytes: Option<usize>,
     source_input_resolver: Option<Arc<dyn SourceInputResolver>>,
+    http_cache_registry: Option<Arc<cache::HttpCacheRegistry>>,
 ) -> Box<dyn CompiledBackendSource> {
     Box::new(HttpCompiledSource {
         manifest,
@@ -67,6 +71,7 @@ pub(crate) fn compile_source(
         request_authenticators,
         body_capture_max_bytes,
         source_input_resolver,
+        http_cache_registry,
     })
 }
 
@@ -82,6 +87,7 @@ pub(crate) fn compile_manifest(
         request.request_authenticators.clone(),
         request.runtime_context.http_body_capture_max_bytes,
         request.source_input_resolver.clone(),
+        request.http_cache_registry.clone(),
     )
 }
 
@@ -96,6 +102,9 @@ impl CompiledBackendSource for HttpCompiledSource {
     }
 
     async fn register(&self, _ctx: &SessionContext) -> Result<BackendRegistration> {
+        let cache = self.http_cache_registry.as_ref().map(|registry| {
+            registry.get_or_create(&self.manifest.common.name, &self.manifest.common.version)
+        });
         let backend = HttpSourceClient::from_manifest_with_source_input_resolver(
             &self.manifest,
             &self.source_secrets,
@@ -104,6 +113,7 @@ impl CompiledBackendSource for HttpCompiledSource {
             self.source.clone(),
             self.source_input_resolver.clone(),
             self.body_capture_max_bytes,
+            cache,
         )?;
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
         let mut table_infos = Vec::with_capacity(self.manifest.tables.len());
