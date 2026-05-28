@@ -780,9 +780,8 @@ impl SourceManager {
                     move |authorization| {
                         let events = authorization_events;
                         async move {
-                            send_import_event(
-                                &events,
-                                ImportSourceWithCredentialsEvent::OAuthAuthorization {
+                            events
+                                .send(ImportSourceWithCredentialsEvent::OAuthAuthorization {
                                     input_key: authorization_input_key,
                                     authorization_url: authorization.authorization_url,
                                     expires_in_seconds: authorization.expires_in_seconds,
@@ -790,21 +789,18 @@ impl SourceManager {
                                     verification_uri: authorization.verification_uri,
                                     verification_uri_complete: authorization
                                         .verification_uri_complete,
-                                },
-                            )
-                            .await
+                                })
+                                .await
                         }
                     },
                 )
                 .await?;
-            send_import_event(
-                &events,
-                ImportSourceWithCredentialsEvent::OAuthCompleted {
+            events
+                .send(ImportSourceWithCredentialsEvent::OAuthCompleted {
                     input_key: material.input_key.clone(),
                     metadata: material.safe_metadata.clone(),
-                },
-            )
-            .await?;
+                })
+                .await?;
             materials.push(material);
         }
         Ok(materials)
@@ -1145,13 +1141,6 @@ fn merge_oauth_material_into_bindings(
         bindings.secrets.extend(internal_metadata);
     }
     Ok(())
-}
-
-async fn send_import_event(
-    events: &ImportSourceEventSender,
-    event: ImportSourceWithCredentialsEvent,
-) -> Result<(), AppError> {
-    events.send(event).await
 }
 
 fn import_stream_closed_message() -> String {
