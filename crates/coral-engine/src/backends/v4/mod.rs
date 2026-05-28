@@ -1,6 +1,6 @@
 //! Runtime registration for materialized DSL v4 projections.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use coral_spec::v4::{
 };
 use coral_spec::{SourceTableFunctionSpec, TableCommon};
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 
 use crate::CoreError;
@@ -169,14 +170,31 @@ impl CompiledBackendSource for V4CompiledSource {
         let mut registered_tables = Vec::new();
         let mut registered_functions = Vec::new();
         let mut inputs = Vec::new();
+        let mut input_keys = BTreeSet::new();
         for compiled in &self.compiled_surfaces {
             let registration = compiled.register(ctx).await?;
-            tables.extend(registration.tables);
-            table_functions.extend(registration.table_functions);
+            for (name, table) in registration.tables {
+                if tables.insert(name.clone(), table).is_some() {
+                    return Err(DataFusionError::Execution(format!(
+                        "DSL v4 source '{}' registered duplicate table '{name}'",
+                        self.source_name
+                    )));
+                }
+            }
+            for (name, function) in registration.table_functions {
+                if table_functions.insert(name.clone(), function).is_some() {
+                    return Err(DataFusionError::Execution(format!(
+                        "DSL v4 source '{}' registered duplicate table function '{name}'",
+                        self.source_name
+                    )));
+                }
+            }
             registered_tables.extend(registration.source.tables);
             registered_functions.extend(registration.source.table_functions);
-            if inputs.is_empty() {
-                inputs = registration.source.inputs;
+            for input in registration.source.inputs {
+                if input_keys.insert(input.key.clone()) {
+                    inputs.push(input);
+                }
             }
         }
         Ok(BackendRegistration {

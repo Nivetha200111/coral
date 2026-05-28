@@ -161,16 +161,24 @@ impl SourceServiceApi for SourceService {
         instrument_grpc(span, async move {
             let request = request.into_inner();
             let workspace_name = workspace_name_from_proto(request.workspace.as_ref())?;
+            let response_workspace_name = workspace_name.clone();
             let bundled_name = SourceName::parse(&request.name).map_err(app_status)?;
             let command = CreateBundledSourceCommand {
                 name: bundled_name,
                 bindings: source_bindings_from_proto(request.variables, request.secrets),
             };
-            let installed = sources
-                .create_bundled_source(&workspace_name, &command)
-                .map_err(app_status)?;
+            let installed = tokio::task::spawn_blocking(move || {
+                sources.create_bundled_source(&workspace_name, &command)
+            })
+            .await
+            .map_err(AppError::from)
+            .and_then(|result| result)
+            .map_err(app_status)?;
             Ok(Response::new(CreateBundledSourceResponse {
-                source: Some(installed_source_to_proto(&workspace_name, installed)),
+                source: Some(installed_source_to_proto(
+                    &response_workspace_name,
+                    installed,
+                )),
             }))
         })
         .await
@@ -232,9 +240,13 @@ impl SourceServiceApi for SourceService {
                     manifest_yaml: request.manifest_yaml,
                     bindings: source_bindings_from_proto(request.variables, request.secrets),
                 };
-                let installed = sources
-                    .import_source(&workspace_name, &command)
-                    .map_err(app_status)?;
+                let installed = tokio::task::spawn_blocking(move || {
+                    sources.import_source(&workspace_name, &command)
+                })
+                .await
+                .map_err(AppError::from)
+                .and_then(|result| result)
+                .map_err(app_status)?;
                 let response = ImportSourceResponse {
                     event: Some(import_source_response::Event::Source(
                         installed_source_to_proto(&response_workspace_name, installed),
@@ -295,12 +307,20 @@ impl SourceServiceApi for SourceService {
         instrument_grpc(span, async move {
             let request = request.into_inner();
             let workspace_name = workspace_name_from_proto(request.workspace.as_ref())?;
+            let response_workspace_name = workspace_name.clone();
             let source_name = SourceName::parse(&request.name).map_err(app_status)?;
-            let result = sources
-                .refresh_source(&workspace_name, &source_name)
-                .map_err(app_status)?;
+            let result = tokio::task::spawn_blocking(move || {
+                sources.refresh_source(&workspace_name, &source_name)
+            })
+            .await
+            .map_err(AppError::from)
+            .and_then(|result| result)
+            .map_err(app_status)?;
             Ok(Response::new(RefreshSourceResponse {
-                source: Some(installed_source_to_proto(&workspace_name, result.source)),
+                source: Some(installed_source_to_proto(
+                    &response_workspace_name,
+                    result.source,
+                )),
                 materialization: Some(materialization_summary_to_proto(result.materialization)),
                 diagnostics: result
                     .diagnostics
