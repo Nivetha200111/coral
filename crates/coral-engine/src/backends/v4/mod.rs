@@ -33,6 +33,9 @@ pub(crate) fn compile_manifest(
 ) -> Result<Box<dyn CompiledBackendSource>, CoreError> {
     let mut compiled_surfaces = Vec::new();
     for surface in &manifest.surfaces {
+        if !has_published_projection(materialized, &surface.id) {
+            continue;
+        }
         let http_manifest = http_manifest_for_surface(manifest, materialized, &surface.id)?;
         compiled_surfaces.push(crate::backends::http::compile_source(
             http_manifest,
@@ -48,6 +51,17 @@ pub(crate) fn compile_manifest(
         source_name: manifest.common.name.clone(),
         compiled_surfaces,
     }))
+}
+
+fn has_published_projection(materialized: &V4MaterializedSource, surface_id: &str) -> bool {
+    materialized
+        .projections
+        .projections
+        .iter()
+        .any(|projection| {
+            projection.surface_id == surface_id
+                && projection.visibility == ProjectionVisibility::Published
+        })
 }
 
 fn http_manifest_for_surface(
