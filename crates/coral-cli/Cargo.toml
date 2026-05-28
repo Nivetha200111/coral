@@ -24,6 +24,7 @@ clap.workspace = true
 clap_complete.workspace = true
 dialoguer.workspace = true
 rust-embed = { workspace = true, optional = true }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
